@@ -22,6 +22,7 @@ import (
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
+	"google.golang.org/adk/v2/agent/workflowagents/sequentialagent"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
@@ -180,8 +181,8 @@ func TestTaskAgent_FinishTaskWithoutOutputKeyWritesNoState(t *testing.T) {
 
 	state := runCoordinatorWithTask(t, taskAgent)
 
-	if got, ok := state[""]; ok {
-		t.Errorf("state[%q] = %v, want no entry under the empty key", "", got)
+	if len(state) != 0 {
+		t.Errorf("session state = %v, want it empty", state)
 	}
 }
 
@@ -205,5 +206,82 @@ func TestTaskAgent_BeforeAgentCallbackContentDoesNotWriteOutputKey(t *testing.T)
 
 	if got, ok := state["task_out"]; ok {
 		t.Errorf("state[%q] = %v after a before-agent callback short-circuit on a task agent, want it unset", "task_out", got)
+	}
+}
+
+// A finish_task call that fails validation is not a result. OutputKey must stay
+// unset until a call is accepted, so the write belongs on the success response,
+// not on the call.
+func TestTaskAgent_RejectedFinishTaskDoesNotWriteOutputKey(t *testing.T) {
+	t.Parallel()
+	schema := &genai.Schema{
+		Type:       genai.TypeObject,
+		Properties: map[string]*genai.Schema{"answer": {Type: genai.TypeString}},
+		Required:   []string{"answer"},
+	}
+	taskLLM := &scriptedLLM{
+		turns: []*model.LLMResponse{{Content: &genai.Content{
+			Role: "model",
+			Parts: []*genai.Part{{FunctionCall: &genai.FunctionCall{
+				ID:   "finish-bad",
+				Name: "finish_task",
+				Args: map[string]any{"wrong_field": "oops"},
+			}}},
+		}}},
+	}
+	taskAgent := makeLLMAgent(t, "doer",
+		withMode(llmagent.ModeTask),
+		withOutputKey("task_out"),
+		withOutputSchema(schema),
+		func(c *llmagent.Config) { c.Model = taskLLM },
+	)
+
+	state := runCoordinatorWithTask(t, taskAgent)
+
+	if got, ok := state["task_out"]; ok {
+		t.Errorf("state[%q] = %v after only a rejected finish_task, want it unset", "task_out", got)
+	}
+}
+
+// A task agent under a workflow agent does not go through runTask, so nothing
+// writes the finish_task output. OutputKey stays unset, and the text turn after
+// finish_task does not fill it either. adk-python behaves the same way. This
+// pins the limit of the OutputKey behaviour for task agents.
+func TestSequentialParentTaskChildLeavesOutputKeyUnset(t *testing.T) {
+	t.Parallel()
+	taskLLM := &scriptedLLM{turns: []*model.LLMResponse{
+		{Content: &genai.Content{Role: "model", Parts: []*genai.Part{{FunctionCall: &genai.FunctionCall{
+			ID: "finish-1", Name: "finish_task", Args: map[string]any{"result": "summarized"},
+		}}}}},
+		{Content: &genai.Content{Role: "model", Parts: []*genai.Part{genai.NewPartFromText("all done")}}},
+	}}
+	taskAgent := makeLLMAgent(t, "doer",
+		withMode(llmagent.ModeTask),
+		withOutputKey("task_out"),
+		func(c *llmagent.Config) { c.Model = taskLLM },
+	)
+	seq, err := sequentialagent.New(sequentialagent.Config{AgentConfig: agent.Config{Name: "seq", SubAgents: []agent.Agent{taskAgent}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := session.InMemoryService()
+	if _, err := svc.Create(t.Context(), &session.CreateRequest{AppName: "app", UserID: "u", SessionID: "s"}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := runner.New(runner.Config{Agent: seq, SessionService: svc, AppName: "app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, err := range r.Run(t.Context(), "u", "s", &genai.Content{Parts: []*genai.Part{genai.NewPartFromText("go")}, Role: "user"}, agent.RunConfig{}) {
+		if err != nil {
+			t.Fatalf("runner.Run: %v", err)
+		}
+	}
+	resp, err := svc.Get(t.Context(), &session.GetRequest{AppName: "app", UserID: "u", SessionID: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, err := resp.Session.State().Get("task_out"); err == nil {
+		t.Errorf("state[%q] = %v under a sequential parent, want it unset", "task_out", v)
 	}
 }
